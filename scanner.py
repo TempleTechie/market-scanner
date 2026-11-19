@@ -1,4 +1,4 @@
-import os, io, json, time, datetime as dt
+import os, io, json, time, urllib.request, datetime as dt
 import numpy as np, pandas as pd, requests, yfinance as yf
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
@@ -55,6 +55,55 @@ def metrics(x):
         dist200=(last / d200 - 1) * 100 if d200 == d200 else np.nan,
         maxdd=float(((c / c.cummax()) - 1).min() * 100),
         turnover=float((c * v).tail(50).mean() / 1e7))  # crore
+
+
+def nifty():
+    try:
+        x = yf.download("^NSEI", period="1y", interval="1d", progress=False, auto_adjust=False)["Close"].squeeze().dropna()
+        return float(x.iloc[-1]), bool(x.iloc[-1] > x.tail(200).mean())
+    except Exception:
+        return None, None
+
+
+def tg_send(text):
+    t, c = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(), os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if t and c:
+        try:
+            urllib.request.urlopen(urllib.request.Request(f"https://api.telegram.org/bot{t}/sendMessage",
+                data=json.dumps({"chat_id": c, "text": text[:4000]}).encode(), headers={"Content-Type": "application/json"}), timeout=20)
+        except Exception as e:
+            print("Telegram failed:", type(e).__name__)
+
+
+def track(df, lists, nv):
+    """Save today's picks, score older picks vs Nifty 50, and list what changed since last run."""
+    hist = json.load(open("docs/history.json")) if os.path.exists("docs/history.json") else []
+    today = dt.datetime.now(IST).date()
+    hist = [h for h in hist if h["d"] != today.isoformat()]
+    rows = []
+    for name in ("short", "long", "weak"):
+        for lb in (7, 28, 84):
+            rs, ex = [], []
+            for h in hist:
+                if (today - dt.date.fromisoformat(h["d"])).days < lb or not h.get("nifty") or not nv:
+                    continue
+                cur = [df.price[k] / p - 1 for k, p in h[name].items() if k in df.index]
+                if cur:
+                    r = float(np.mean(cur)) * 100
+                    rs.append(r); ex.append(r - (nv / h["nifty"] - 1) * 100)
+            if rs:
+                rows.append(dict(list=name, days=lb, runs=len(rs), avg=clean(np.mean(rs)), excess=clean(np.mean(ex))))
+    prev = hist[-1] if hist else None
+    msg = ""
+    if prev:
+        for name, label in (("short", "Short-term"), ("long", "Long-term"), ("weak", "Weak")):
+            new, gone = set(lists[name]) - set(prev[name]), set(prev[name]) - set(lists[name])
+            if new or gone:
+                msg += f"{label}: " + (f"+ {', '.join(sorted(new))} " if new else "") + (f"- {', '.join(sorted(gone))}" if gone else "") + "\n"
+    hist.append(dict(d=today.isoformat(), nifty=nv, **{k: {s: round(float(df.price[s]), 2) for s in v} for k, v in lists.items()}))
+    os.makedirs("docs", exist_ok=True)
+    json.dump(hist[-400:], open("docs/history.json", "w"))
+    return rows, msg
 
 
 def pr(s, higher=True):
@@ -136,7 +185,16 @@ def main():
     tag.update({s: "weak" for s in df.index[df.weak_flag]})  # weak flag wins
     df["tag"] = [tag.get(s, "") for s in df.index]
     df["symbol"] = df.index
-    cols = ["symbol", "name", "industry", "price", "day", "ret1m", "ret3m", "ret6m", "ret12m", "from_high",
+    nv, nup = nifty()
+    b200 = df.above200.mean() * 100
+    mood = ("Weak", "Market looks weak: Nifty is below its 200-day average and few stocks are above theirs. Momentum picks fail more often in falling markets.") if (nup is False and b200 < 45) else \
+           ("Healthy", "Market looks healthy: Nifty is above its 200-day average and most stocks are in uptrends.") if (nup and b200 >= 55) else \
+           ("Mixed", "Market is mixed. Be selective and check each pick yourself.")
+    trk, chg = track(df, dict(short=list(short.index), long=list(long_.index), weak=list(weak.index)), nv)
+    if chg:
+        tg_send("📊 Scanner changes " + dt.datetime.now(IST).strftime("%d %b") + "\n" + chg + "(+ new, - dropped)\nMarket mood: " + mood[0])
+    df["spark"] = [[round(float(v), 1) for v in px[s].Close.iloc[::-5][::-1]] for s in df.index]
+    cols = ["symbol", "spark", "name", "industry", "price", "day", "ret1m", "ret3m", "ret6m", "ret12m", "from_high",
             "vol_surge", "dist200", "weak_flag", "tag"]
     rows = lambda d, extra=("score", "note"): [{k: clean(v) for k, v in r.items()} for r in
                                                d.assign(symbol=d.index)[["symbol", "name", "industry", "price", "ret1m", "ret3m",
@@ -146,6 +204,7 @@ def main():
         breadth=dict(above50=clean(df.above50.mean() * 100), above200=clean(df.above200.mean() * 100),
                      advancers=clean((df.day > 0).mean() * 100), median1m=clean(df.ret1m.median()),
                      median3m=clean(df.ret3m.median())),
+        mood=dict(label=mood[0], text=mood[1]), track=trk,
         short=rows(short), long=rows(long_), weak=rows(weak),
         sectors=[{k: clean(v) for k, v in r.items()} for r in sec.to_dict("records")],
         all=[{k: clean(v) for k, v in r.items()} for r in df[cols].to_dict("records")])
@@ -170,10 +229,11 @@ h1{font-size:20px;margin:4px 0}.m{color:var(--mut);font-size:12px}
 .w{overflow-x:auto}table{border-collapse:collapse;width:100%;margin-top:8px}
 th,td{padding:6px 8px;text-align:right;white-space:nowrap;border-bottom:1px solid var(--card)}
 th:first-child,td:first-child,td:nth-child(2){text-align:left}th{cursor:pointer;color:var(--mut)}
+.st{cursor:pointer;color:#e0a800}.lk{color:var(--ac);cursor:pointer;text-decoration:underline}#md{display:none;position:fixed;inset:0;background:#0008;padding:16px;overflow:auto}#md div{background:var(--bg);max-width:420px;margin:auto;padding:14px;border-radius:10px}
 .up{color:var(--up)}.dn{color:var(--dn)}input{width:100%;padding:8px;box-sizing:border-box;margin-top:8px}
 </style></head><body>
-<h1>Nifty 500 Scanner</h1><div class=m id=gen></div><div class=cards id=br></div>
-<div class=tabs id=tabs></div><div id=out></div>
+<h1>Nifty 500 Scanner</h1><div class=m id=gen></div><div id=mood class=c></div><div class=cards id=br></div>
+<div id=md></div><div class=tabs id=tabs></div><div id=out></div>
 <p class=m>Data from Yahoo Finance, computed by a free script. Rankings are statistical screens, not investment advice or predictions.
 Check a company's business, valuation and news yourself before acting.</p>
 <script id=d type=application/json>__DATA__</script>
@@ -184,13 +244,17 @@ const S=[['Stock','symbol'],['Industry','industry'],['Price','price',2,'',0],['1
 ['6M','ret6m',1,'%',1],['vs 52w high','from_high',1,'%',1],['Vol ×','vol_surge',2,'×',0],['Score','score',0,'',0],['Note','note']];
 const A=S.filter(c=>c[1]!='score'&&c[1]!='note').concat([['Tag','tag']]);
 const SEC=[['Industry','industry'],['Stocks','stocks',0,'',0],['1M median','ret1m',1,'%',1],['3M median','ret3m',1,'%',1],['% above 200-day','above200',0,'%',0]];
+const W=new Set(),K='wl';try{JSON.parse(localStorage.getItem(K)||'[]').forEach(x=>W.add(x))}catch(e){}
+const save=()=>{try{localStorage.setItem(K,JSON.stringify([...W]))}catch(e){}};
 function T(rows,cols){return '<div class=w><table><tr>'+cols.map(c=>'<th data-k="'+c[1]+'">'+c[0]+'</th>').join('')+'</tr>'+
-rows.map(r=>'<tr>'+cols.map(c=>{const v=r[c[1]];return c[2]===undefined?'<td title="'+(r.name||'')+'">'+(v??'')+'</td>':
+rows.map(r=>'<tr>'+cols.map(c=>{const v=r[c[1]];return c[1]=='symbol'?'<td title="'+(r.name||'')+'"><span class=st data-s="'+v+'">'+(W.has(v)?'★':'☆')+'</span> <a class=lk data-s="'+v+'">'+v+'</a></td>':c[2]===undefined?'<td title="'+(r.name||'')+'">'+(v??'')+'</td>':
 '<td class="'+(c[4]?C(v):'')+'">'+F(v,c[2])+(v==null?'':c[3])+'</td>'}).join('')+'</tr>').join('')+'</table></div>'}
 document.getElementById('gen').textContent='Updated '+D.generated+' · '+D.scanned+' stocks scanned';
 const b=D.breadth;document.getElementById('br').innerHTML=[['Above 50-day',F(b.above50,0)+'%'],['Above 200-day',F(b.above200,0)+'%'],
 ['Up today',F(b.advancers,0)+'%'],['Median 1M',F(b.median1m,1)+'%'],['Median 3M',F(b.median3m,1)+'%']].map(x=>'<div class=c>'+x[0]+'<b>'+x[1]+'</b></div>').join('');
-const TABS={'Short-term':()=>T(D.short,S),'Long-term':()=>T(D.long,S),'Weak / fading':()=>T(D.weak,S),
+const TR=[['List','list'],['Picks at least (days old)','days',0,'',0],['Days sampled','runs',0,'',0],['Avg return since listed','avg',1,'%',1],['vs Nifty 50','excess',1,'%',1]];
+const TABS={'Watchlist':()=>W.size?T(D.all.filter(x=>W.has(x.symbol)),A):'<p class=m>Tap ☆ next to a stock to add it here. Saved in this browser only.</p>',
+'Track record':()=>(D.track.length?T(D.track,TR):'<p class=m>Needs a few weeks of daily history.</p>')+'<p class=m>Average return of past picks since they were listed, versus the Nifty 50. Early numbers are noisy.</p>','Short-term':()=>T(D.short,S),'Long-term':()=>T(D.long,S),'Weak / fading':()=>T(D.weak,S),
 'Sectors':()=>T(D.sectors,SEC),'All stocks':null};
 let cur='Short-term',sk='ret3m',sd=-1;
 function show(){document.getElementById('tabs').innerHTML=Object.keys(TABS).map(k=>'<button class="'+(k==cur?'on':'')+'" data-t="'+k+'">'+k+'</button>').join('');
@@ -200,7 +264,14 @@ const q=document.getElementById('q');q.oninput=all;all()}else o.innerHTML=TABS[c
 function all(){const q=document.getElementById('q').value.toLowerCase();
 let r=D.all.filter(x=>(x.symbol+x.name+x.industry).toLowerCase().includes(q));
 r.sort((a,b)=>sd*((a[sk]??-1e9)-(b[sk]??-1e9))||0);document.getElementById('tb').innerHTML=T(r.slice(0,150),A)}
+document.getElementById('mood').innerHTML='<b>Market mood: '+D.mood.label+'</b><div class=m>'+D.mood.text+'</div>';
+function detail(s){const x=D.all.find(a=>a.symbol==s),sp=x.spark||[],lo=Math.min(...sp),hi=Math.max(...sp),sc=D.sectors.find(a=>a.industry==x.industry);
+const pts=sp.map((v,i)=>(i*300/(sp.length-1||1)).toFixed(0)+','+(80-(v-lo)/((hi-lo)||1)*76).toFixed(0)).join(' ');
+document.getElementById('md').innerHTML='<div><b>'+x.symbol+'</b> · '+x.name+'<div class=m>'+x.industry+'</div><svg viewBox="0 0 300 84" width=100% ><polyline fill=none stroke="var(--ac)" stroke-width=2 points="'+pts+'"/></svg><div class=m>1-year price, weekly</div><p>Price '+F(x.price,2)+' · 1M '+F(x.ret1m,1)+'% · 3M '+F(x.ret3m,1)+'% · 6M '+F(x.ret6m,1)+'%<br>'+F(x.from_high,1)+'% from 52w high · volume '+F(x.vol_surge,2)+'× normal · '+F(x.dist200,1)+'% vs 200-day avg<br>Sector 3M median: '+(sc?F(sc.ret3m,1)+'%':'–')+' · Tag: '+(x.tag||'none')+'</p><button class="on" data-x=1>Close</button></div>';document.getElementById('md').style.display='block'}
 document.addEventListener('click',e=>{const t=e.target;
+if(t.classList.contains('st')){W.has(t.dataset.s)?W.delete(t.dataset.s):W.add(t.dataset.s);save();show();return}
+if(t.classList.contains('lk')){detail(t.dataset.s);return}
+if(t.dataset.x||t.id=='md'){document.getElementById('md').style.display='none';return}
 if(t.dataset.t){cur=t.dataset.t;show()}
 else if(t.tagName=='TH'&&cur=='All stocks'&&t.dataset.k){sd=sk==t.dataset.k?-sd:-1;sk=t.dataset.k;all()}});
 show();
