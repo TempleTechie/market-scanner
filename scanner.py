@@ -193,6 +193,8 @@ def main():
     trk, chg = track(df, dict(short=list(short.index), long=list(long_.index), weak=list(weak.index)), nv)
     if chg:
         tg_send("📊 Scanner changes " + dt.datetime.now(IST).strftime("%d %b") + "\n" + chg + "(+ new, - dropped)\nMarket mood: " + mood[0])
+    longest = max(px.values(), key=len)
+    sdates = [d.strftime("%d %b %y") for d in longest.index[::-5][::-1]]
     df["spark"] = [[round(float(v), 1) for v in px[s].Close.iloc[::-5][::-1]] for s in df.index]
     cols = ["symbol", "spark", "name", "industry", "price", "day", "ret1m", "ret3m", "ret6m", "ret12m", "from_high",
             "vol_surge", "dist200", "weak_flag", "tag"]
@@ -204,7 +206,7 @@ def main():
         breadth=dict(above50=clean(df.above50.mean() * 100), above200=clean(df.above200.mean() * 100),
                      advancers=clean((df.day > 0).mean() * 100), median1m=clean(df.ret1m.median()),
                      median3m=clean(df.ret3m.median())),
-        mood=dict(label=mood[0], text=mood[1]), track=trk,
+        mood=dict(label=mood[0], text=mood[1]), track=trk, sdates=sdates,
         short=rows(short), long=rows(long_), weak=rows(weak),
         sectors=[{k: clean(v) for k, v in r.items()} for r in sec.to_dict("records")],
         all=[{k: clean(v) for k, v in r.items()} for r in df[cols].to_dict("records")])
@@ -265,9 +267,19 @@ function all(){const q=document.getElementById('q').value.toLowerCase();
 let r=D.all.filter(x=>(x.symbol+x.name+x.industry).toLowerCase().includes(q));
 r.sort((a,b)=>sd*((a[sk]??-1e9)-(b[sk]??-1e9))||0);document.getElementById('tb').innerHTML=T(r.slice(0,150),A)}
 document.getElementById('mood').innerHTML='<b>Market mood: '+D.mood.label+'</b><div class=m>'+D.mood.text+'</div>';
-function detail(s){const x=D.all.find(a=>a.symbol==s),sp=x.spark||[],lo=Math.min(...sp),hi=Math.max(...sp),sc=D.sectors.find(a=>a.industry==x.industry);
-const pts=sp.map((v,i)=>(i*300/(sp.length-1||1)).toFixed(0)+','+(80-(v-lo)/((hi-lo)||1)*76).toFixed(0)).join(' ');
-document.getElementById('md').innerHTML='<div><b>'+x.symbol+'</b> · '+x.name+'<div class=m>'+x.industry+'</div><svg viewBox="0 0 300 84" width=100% ><polyline fill=none stroke="var(--ac)" stroke-width=2 points="'+pts+'"/></svg><div class=m>1-year price, weekly</div><p>Price '+F(x.price,2)+' · 1M '+F(x.ret1m,1)+'% · 3M '+F(x.ret3m,1)+'% · 6M '+F(x.ret6m,1)+'%<br>'+F(x.from_high,1)+'% from 52w high · volume '+F(x.vol_surge,2)+'× normal · '+F(x.dist200,1)+'% vs 200-day avg<br>Sector 3M median: '+(sc?F(sc.ret3m,1)+'%':'–')+' · Tag: '+(x.tag||'none')+'</p><button class="on" data-x=1>Close</button></div>';document.getElementById('md').style.display='block'}
+function detail(s){const x=D.all.find(a=>a.symbol==s),sp=x.spark||[],ds=D.sdates.slice(-sp.length),sc=D.sectors.find(a=>a.industry==x.industry);
+document.getElementById('md').innerHTML='<div><b>'+x.symbol+'</b> · '+x.name+'<div class=m>'+x.industry+'</div>'+chart(sp)+'<div id=tip class=m>Hover or touch the chart for date and price</div><p>Price '+F(x.price,2)+' · 1M '+F(x.ret1m,1)+'% · 3M '+F(x.ret3m,1)+'% · 6M '+F(x.ret6m,1)+'%<br>'+F(x.from_high,1)+'% from 52w high · volume '+F(x.vol_surge,2)+'× normal · '+F(x.dist200,1)+'% vs 200-day avg<br>Sector 3M median: '+(sc?F(sc.ret3m,1)+'%':'–')+' · Tag: '+(x.tag||'none')+'</p><button class="on" data-x=1>Close</button></div>';
+document.getElementById('md').style.display='block';hover(sp,ds)}
+const CW=300,CH=110,lo_=a=>Math.min(...a),hi_=a=>Math.max(...a);
+const cx=(i,n)=>i*CW/(n-1||1),cy=(v,a)=>8+(CH-26)*(1-(v-lo_(a))/((hi_(a)-lo_(a))||1));
+function chart(sp){const n=sp.length,hi=hi_(sp),lo=lo_(sp),up=sp[n-1]>=sp[0],col=up?'var(--up)':'var(--dn)',p=sp.map((v,i)=>cx(i,n).toFixed(1)+','+cy(v,sp).toFixed(1)).join(' ');
+const mk=(v,t)=>{const i=sp.indexOf(v),X=cx(i,n),Y=cy(v,sp);return '<circle cx='+X+' cy='+Y+' r=3 fill="'+col+'"/><text x='+X+' y='+(t=='H'?Y-5:Y+12)+' font-size=9 fill="var(--mut)" text-anchor='+(X>150?'end':'start')+'>'+t+' '+v.toFixed(1)+'</text>'};
+return '<svg id=ch viewBox="0 0 300 110" width=100% style="touch-action:none;cursor:crosshair"><polygon fill="'+col+'" opacity=.13 points="0,'+(CH-18)+' '+p+' '+CW+','+(CH-18)+'"/><polyline fill=none stroke="'+col+'" stroke-width=2 points="'+p+'"/>'+mk(hi,'H')+mk(lo,'L')+'<line id=cl y1=4 y2='+(CH-18)+' stroke="var(--mut)" stroke-dasharray="3 3" opacity=0 /><circle id=cd r=4.5 fill="'+col+'" stroke="var(--bg)" stroke-width=2 opacity=0 /></svg>'}
+function hover(sp,ds){const s=document.getElementById('ch');if(!s)return;const n=sp.length,hi=hi_(sp);
+const mv=e=>{const r=s.getBoundingClientRect(),i=Math.max(0,Math.min(n-1,Math.round((e.clientX-r.left)/r.width*(n-1)))),X=cx(i,n),Y=cy(sp[i],sp),l=document.getElementById('cl'),d=document.getElementById('cd'),ch=(sp[i]/sp[0]-1)*100;
+l.setAttribute('x1',X);l.setAttribute('x2',X);l.setAttribute('opacity',1);d.setAttribute('cx',X);d.setAttribute('cy',Y);d.setAttribute('opacity',1);
+document.getElementById('tip').innerHTML='<b>'+(ds[i]||'')+'</b> · ₹'+F(sp[i],2)+' · '+(ch>=0?'+':'')+F(ch,1)+'% vs a year ago · '+F((sp[i]/hi-1)*100,1)+'% from the high'};
+s.addEventListener('pointermove',mv);s.addEventListener('pointerdown',mv)}
 document.addEventListener('click',e=>{const t=e.target;
 if(t.classList.contains('st')){W.has(t.dataset.s)?W.delete(t.dataset.s):W.add(t.dataset.s);save();show();return}
 if(t.classList.contains('lk')){detail(t.dataset.s);return}
