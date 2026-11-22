@@ -53,6 +53,7 @@ def metrics(x):
         vol_surge=float(v.tail(5).mean() / max(v.tail(50).mean(), 1)),
         above50=last > float(c.tail(50).mean()), above200=bool(last > d200) if d200 == d200 else False,
         dist200=(last / d200 - 1) * 100 if d200 == d200 else np.nan,
+        dist50=(last / float(c.tail(50).mean()) - 1) * 100, ma50=float(c.tail(50).mean()), ma200=d200,
         maxdd=float(((c / c.cummax()) - 1).min() * 100),
         turnover=float((c * v).tail(50).mean() / 1e7))  # crore
 
@@ -81,13 +82,13 @@ def track(df, lists, nv):
     today = dt.datetime.now(IST).date()
     hist = [h for h in hist if h["d"] != today.isoformat()]
     rows = []
-    for name in ("short", "long", "weak"):
+    for name in ("short", "long", "weak", "pick"):
         for lb in (7, 28, 84):
             rs, ex = [], []
             for h in hist:
                 if (today - dt.date.fromisoformat(h["d"])).days < lb or not h.get("nifty") or not nv:
                     continue
-                cur = [df.price[k] / p - 1 for k, p in h[name].items() if k in df.index]
+                cur = [df.price[k] / p - 1 for k, p in h.get(name, {}).items() if k in df.index]
                 if cur:
                     r = float(np.mean(cur)) * 100
                     rs.append(r); ex.append(r - (nv / h["nifty"] - 1) * 100)
@@ -96,14 +97,26 @@ def track(df, lists, nv):
     prev = hist[-1] if hist else None
     msg = ""
     if prev:
-        for name, label in (("short", "Short-term"), ("long", "Long-term"), ("weak", "Weak")):
-            new, gone = set(lists[name]) - set(prev[name]), set(prev[name]) - set(lists[name])
+        for name, label in (("pick", "Shortlist"), ("short", "Short-term"), ("long", "Long-term"), ("weak", "Weak")):
+            new, gone = set(lists[name]) - set(prev.get(name, [])), set(prev.get(name, [])) - set(lists[name])
             if new or gone:
                 msg += f"{label}: " + (f"+ {', '.join(sorted(new))} " if new else "") + (f"- {', '.join(sorted(gone))}" if gone else "") + "\n"
     hist.append(dict(d=today.isoformat(), nifty=nv, **{k: {s: round(float(df.price[s]), 2) for s in v} for k, v in lists.items()}))
     os.makedirs("docs", exist_ok=True)
     json.dump(hist[-400:], open("docs/history.json", "w"))
     return rows, msg
+
+
+def since(df, picks, nv):
+    """For each current pick: when it first appeared on the shortlist, and how it did since."""
+    hist = json.load(open("docs/history.json")) if os.path.exists("docs/history.json") else []
+    out = {}
+    for s in picks:
+        h = next((h for h in hist if s in h.get("pick", {})), None)
+        if h and h.get("nifty") and nv:
+            p = h["pick"][s]
+            out[s] = dict(first=h["d"], since_ret=clean((df.price[s] / p - 1) * 100), vs=clean((df.price[s] / p - 1) * 100 - (nv / h["nifty"] - 1) * 100))
+    return out
 
 
 def pr(s, higher=True):
@@ -186,11 +199,35 @@ def main():
     df["tag"] = [tag.get(s, "") for s in df.index]
     df["symbol"] = df.index
     nv, nup = nifty()
+    mkt3 = df.ret3m.median()
+    df["sec3m"] = df.industry.map(sec.set_index("industry").ret3m)
+    cand = pool[(df.reindex(pool.index).turnover >= 5) & df.reindex(pool.index).above50].copy()
+    d = df.reindex(cand.index)
+    keep = (d.ret3m > mkt3) & (d.ret1m < 20) & (d.dist50 < 15) & (d.maxdd > -35) & (d.vol_surge >= 0.9) & (d.sec3m > mkt3)
+    cand = cand[keep.values]
+    cand["final"] = 0.5 * cand.score + 0.5 * df.short.reindex(cand.index)
+    sl = cand.nlargest(N, "final")
+    f_roe = f.roe.reindex(sl.index)
+    shortlist = []
+    for s_, r in sl.iterrows():
+        x = df.loc[s_]
+        why = [f"beats the median stock by {x.ret3m - mkt3:.0f} pts over 3M", "above 50 and 200-day averages",
+               f"sector leading (3M median {x.sec3m:+.0f}%)", f"volume {x.vol_surge:.1f}x normal",
+               f"ROE {f_roe[s_] * 100:.0f}%" if f_roe[s_] == f_roe[s_] else None]
+        risks = [t for t in ["fundamentals n/a" if r.nq < 2 else None, "up fast this month" if x.ret1m > 12 else None,
+                             f"volatile (1y drawdown {x.maxdd:.0f}%)" if x.maxdd < -25 else None,
+                             "market mood weak" if (nup is False and df.above200.mean() * 100 < 45) else None] if t]
+        shortlist.append(dict(symbol=s_, name=x["name"], industry=x.industry, price=clean(x.price), score=clean(r.final),
+                              why="; ".join(w for w in why if w), risks="; ".join(risks) or "none flagged",
+                              lv=f"50-day avg ₹{x.ma50:.0f}" + (f", 200-day avg ₹{x.ma200:.0f}" if x.ma200 == x.ma200 else "")))
     b200 = df.above200.mean() * 100
     mood = ("Weak", "Market looks weak: Nifty is below its 200-day average and few stocks are above theirs. Momentum picks fail more often in falling markets.") if (nup is False and b200 < 45) else \
            ("Healthy", "Market looks healthy: Nifty is above its 200-day average and most stocks are in uptrends.") if (nup and b200 >= 55) else \
            ("Mixed", "Market is mixed. Be selective and check each pick yourself.")
-    trk, chg = track(df, dict(short=list(short.index), long=list(long_.index), weak=list(weak.index)), nv)
+    sinc = since(df, list(sl.index), nv)
+    for r in shortlist:
+        r.update(sinc.get(r['symbol'], dict(first=None, since_ret=None, vs=None)))
+    trk, chg = track(df, dict(pick=list(sl.index), short=list(short.index), long=list(long_.index), weak=list(weak.index)), nv)
     if chg:
         tg_send("📊 Scanner changes " + dt.datetime.now(IST).strftime("%d %b") + "\n" + chg + "(+ new, - dropped)\nMarket mood: " + mood[0])
     longest = max(px.values(), key=len)
@@ -206,7 +243,7 @@ def main():
         breadth=dict(above50=clean(df.above50.mean() * 100), above200=clean(df.above200.mean() * 100),
                      advancers=clean((df.day > 0).mean() * 100), median1m=clean(df.ret1m.median()),
                      median3m=clean(df.ret3m.median())),
-        mood=dict(label=mood[0], text=mood[1]), track=trk, sdates=sdates,
+        mood=dict(label=mood[0], text=mood[1]), track=trk, sdates=sdates, shortlist=shortlist,
         short=rows(short), long=rows(long_), weak=rows(weak),
         sectors=[{k: clean(v) for k, v in r.items()} for r in sec.to_dict("records")],
         all=[{k: clean(v) for k, v in r.items()} for r in df[cols].to_dict("records")])
@@ -231,7 +268,7 @@ h1{font-size:20px;margin:4px 0}.m{color:var(--mut);font-size:12px}
 .w{overflow-x:auto}table{border-collapse:collapse;width:100%;margin-top:8px}
 th,td{padding:6px 8px;text-align:right;white-space:nowrap;border-bottom:1px solid var(--card)}
 th:first-child,td:first-child,td:nth-child(2){text-align:left}th{cursor:pointer;color:var(--mut)}
-.st{cursor:pointer;color:#e0a800}.lk{color:var(--ac);cursor:pointer;text-decoration:underline}#md{display:none;position:fixed;inset:0;background:#0008;padding:16px;overflow:auto}#md div{background:var(--bg);max-width:420px;margin:auto;padding:14px;border-radius:10px}
+.wr{white-space:normal;min-width:180px;text-align:left}.st{cursor:pointer;color:#e0a800}.lk{color:var(--ac);cursor:pointer;text-decoration:underline}#md{display:none;position:fixed;inset:0;background:#0008;padding:16px;overflow:auto}#md div{background:var(--bg);max-width:420px;margin:auto;padding:14px;border-radius:10px}
 .up{color:var(--up)}.dn{color:var(--dn)}input{width:100%;padding:8px;box-sizing:border-box;margin-top:8px}
 </style></head><body>
 <h1>Nifty 500 Scanner</h1><div class=m id=gen></div><div id=mood class=c></div><div class=cards id=br></div>
@@ -249,16 +286,18 @@ const SEC=[['Industry','industry'],['Stocks','stocks',0,'',0],['1M median','ret1
 const W=new Set(),K='wl';try{JSON.parse(localStorage.getItem(K)||'[]').forEach(x=>W.add(x))}catch(e){}
 const save=()=>{try{localStorage.setItem(K,JSON.stringify([...W]))}catch(e){}};
 function T(rows,cols){return '<div class=w><table><tr>'+cols.map(c=>'<th data-k="'+c[1]+'">'+c[0]+'</th>').join('')+'</tr>'+
-rows.map(r=>'<tr>'+cols.map(c=>{const v=r[c[1]];return c[1]=='symbol'?'<td title="'+(r.name||'')+'"><span class=st data-s="'+v+'">'+(W.has(v)?'★':'☆')+'</span> <a class=lk data-s="'+v+'">'+v+'</a></td>':c[2]===undefined?'<td title="'+(r.name||'')+'">'+(v??'')+'</td>':
+rows.map(r=>'<tr>'+cols.map(c=>{const v=r[c[1]];return c[1]=='symbol'?'<td title="'+(r.name||'')+'"><span class=st data-s="'+v+'">'+(W.has(v)?'★':'☆')+'</span> <a class=lk data-s="'+v+'">'+v+'</a></td>':c[2]===undefined?'<td class="'+(['why','risks','lv'].includes(c[1])?'wr':'')+'" title="'+(r.name||'')+'">'+(v??'')+'</td>':
 '<td class="'+(c[4]?C(v):'')+'">'+F(v,c[2])+(v==null?'':c[3])+'</td>'}).join('')+'</tr>').join('')+'</table></div>'}
 document.getElementById('gen').textContent='Updated '+D.generated+' · '+D.scanned+' stocks scanned';
 const b=D.breadth;document.getElementById('br').innerHTML=[['Above 50-day',F(b.above50,0)+'%'],['Above 200-day',F(b.above200,0)+'%'],
 ['Up today',F(b.advancers,0)+'%'],['Median 1M',F(b.median1m,1)+'%'],['Median 3M',F(b.median3m,1)+'%']].map(x=>'<div class=c>'+x[0]+'<b>'+x[1]+'</b></div>').join('');
 const TR=[['List','list'],['Picks at least (days old)','days',0,'',0],['Days sampled','runs',0,'',0],['Avg return since listed','avg',1,'%',1],['vs Nifty 50','excess',1,'%',1]];
-const TABS={'Watchlist':()=>W.size?T(D.all.filter(x=>W.has(x.symbol)),A):'<p class=m>Tap ☆ next to a stock to add it here. Saved in this browser only.</p>',
+const SL=[['Stock','symbol'],['Price','price',2,'',0],['Score','score',0,'',0],['Listed since','first'],['Since listed','since_ret',1,'%',1],['vs Nifty 50','vs',1,'%',1],['Why it passed','why'],['Risks','risks'],['Reference levels','lv']];
+const TABS={'Research shortlist':()=>'<p class=m><b>Research shortlist, not buy advice.</b> A rules-based screen: strong 3M momentum vs the median stock, above 50 and 200-day averages, leading sector, healthy volume, not up too fast, shallow drawdown, plus Yahoo profitability data. Built by an AI, not a SEBI-registered advisor. It cannot see news, results or valuation, so check each company yourself. Reference levels are chart points, not stop-loss advice.</p>'+(D.shortlist.length?T(D.shortlist,SL):'<p>No stock passes all the filters today. That is a valid result.</p>'),
+'Watchlist':()=>W.size?T(D.all.filter(x=>W.has(x.symbol)),A):'<p class=m>Tap ☆ next to a stock to add it here. Saved in this browser only.</p>',
 'Track record':()=>(D.track.length?T(D.track,TR):'<p class=m>Needs a few weeks of daily history.</p>')+'<p class=m>Average return of past picks since they were listed, versus the Nifty 50. Early numbers are noisy.</p>','Short-term':()=>T(D.short,S),'Long-term':()=>T(D.long,S),'Weak / fading':()=>T(D.weak,S),
 'Sectors':()=>T(D.sectors,SEC),'All stocks':null};
-let cur='Short-term',sk='ret3m',sd=-1;
+let cur='Research shortlist',sk='ret3m',sd=-1;
 function show(){document.getElementById('tabs').innerHTML=Object.keys(TABS).map(k=>'<button class="'+(k==cur?'on':'')+'" data-t="'+k+'">'+k+'</button>').join('');
 const o=document.getElementById('out');
 if(cur=='All stocks'){o.innerHTML='<input id=q placeholder="Search symbol, name or industry"><div id=tb></div>';
