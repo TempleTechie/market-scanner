@@ -1,332 +1,387 @@
-import os, io, json, time, urllib.request, datetime as dt
-import numpy as np, pandas as pd, requests, yfinance as yf
+import os, sys, json, smtplib, urllib.request, datetime as dt
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+import pandas as pd, pyotp, yfinance as yf
+from growwapi import GrowwAPI
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
-URLS = ["https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv",
-        "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"]
-HDR = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}
-N = 10
+MODE = os.environ.get("MODE", "hourly")          # hourly | alert | weekly | monthly
+ALERT_PCT = float(os.environ.get("ALERT_PCT", "5"))  # alert threshold in % (change here or via env)
+TOP_N = 10
+HR_N = 5
+CONC_WARN = float(os.environ.get("CONC_WARN", "8"))  # warn if one stock is above this % of portfolio
+BIG_MOVE = {"hourly": ALERT_PCT, "weekly": 10, "monthly": 15}
 
 
-def universe():
-    for u in URLS:
-        try:
-            r = requests.get(u, headers=HDR, timeout=30)
-            r.raise_for_status()
-            df = pd.read_csv(io.StringIO(r.text))
-            if len(df) > 300:
-                df.to_csv("nifty500_backup.csv", index=False)
-                return df
-        except Exception as e:
-            print("Nifty 500 list fetch failed:", u.split("/")[2], type(e).__name__)
-    if os.path.exists("nifty500_backup.csv"):
-        print("Using nifty500_backup.csv")
-        return pd.read_csv("nifty500_backup.csv")
-    raise SystemExit("Could not get the Nifty 500 list. Download it from NSE and upload it as nifty500_backup.csv")
+def inr(x, sign=False, dec=0, sym="₹"):
+    """Indian digit grouping: 1234567 -> ₹12,34,567"""
+    neg = round(abs(x), dec) != 0 and x < 0
+    whole, _, frac = f"{abs(x):.{dec}f}".partition(".")
+    if len(whole) > 3:
+        head, tail, parts = whole[:-3], whole[-3:], []
+        while len(head) > 2:
+            parts.insert(0, head[-2:]); head = head[:-2]
+        if head:
+            parts.insert(0, head)
+        whole = ",".join(parts + [tail])
+    out = whole + ("." + frac if dec else "")
+    return f"{sym}{'-' if neg else ('+' if sign else '')}{out}"
 
 
-def prices(symbols):
+def get_holdings():
+    totp = pyotp.TOTP(os.environ["GROWW_TOTP_SECRET"].strip().strip('"').replace(" ", "")).now()
+    token = GrowwAPI.get_access_token(api_key=os.environ["GROWW_API_KEY"], totp=totp)
+    rows = GrowwAPI(token).get_holdings_for_user(timeout=20)["holdings"]
+    df = pd.DataFrame(rows)[["trading_symbol", "quantity", "average_price"]]
+    return df[df.quantity > 0].reset_index(drop=True)
+
+
+def closes(symbols, period="7d", interval="1d"):
+    """symbol -> Series of closing prices. Tries NSE (.NS) first, then BSE (.BO)."""
     out = {}
-    for i in range(0, len(symbols), 100):
-        chunk = symbols[i:i + 100]
-        d = yf.download([s + ".NS" for s in chunk], period="1y", interval="1d", group_by="ticker",
-                        progress=False, auto_adjust=False, threads=True)
-        for s in chunk:
+    for suffix in (".NS", ".BO"):
+        todo = [s for s in symbols if s not in out]
+        if not todo:
+            break
+        data = yf.download([s + suffix for s in todo], period=period, interval=interval,
+                           group_by="ticker", progress=False, auto_adjust=False, threads=True)
+        for s in todo:
             try:
-                x = d[s + ".NS"][["Close", "High", "Volume"]].dropna()
-                if len(x) >= 120:
-                    out[s] = x
+                c = data[s + suffix]["Close"].dropna()
+                if len(c) >= 2:
+                    out[s] = c
             except Exception:
                 pass
     return out
 
 
-def metrics(x):
-    c, h, v = x.Close, x.High, x.Volume
-    n, last = len(c), float(c.iloc[-1])
-    ret = lambda k: (last / float(c.iloc[-1 - k]) - 1) * 100 if n > k else np.nan
-    d200 = float(c.tail(200).mean()) if n >= 200 else np.nan
-    return dict(
-        price=last, day=ret(1), ret1m=ret(21), ret3m=ret(63), ret6m=ret(126),
-        ret12m=(last / float(c.iloc[0]) - 1) * 100,
-        from_high=(last / float(h.max()) - 1) * 100,
-        vol_surge=float(v.tail(5).mean() / max(v.tail(50).mean(), 1)),
-        above50=last > float(c.tail(50).mean()), above200=bool(last > d200) if d200 == d200 else False,
-        dist200=(last / d200 - 1) * 100 if d200 == d200 else np.nan,
-        dist50=(last / float(c.tail(50).mean()) - 1) * 100, ma50=float(c.tail(50).mean()), ma200=d200,
-        maxdd=float(((c / c.cummax()) - 1).min() * 100),
-        turnover=float((c * v).tail(50).mean() / 1e7))  # crore
-
-
-def nifty():
-    try:
-        x = yf.download("^NSEI", period="1y", interval="1d", progress=False, auto_adjust=False)["Close"].squeeze().dropna()
-        return float(x.iloc[-1]), bool(x.iloc[-1] > x.tail(200).mean())
-    except Exception:
-        return None, None
-
-
-def tg_send(text):
-    t, c = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(), os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-    if t and c:
-        try:
-            urllib.request.urlopen(urllib.request.Request(f"https://api.telegram.org/bot{t}/sendMessage",
-                data=json.dumps({"chat_id": c, "text": text[:4000]}).encode(), headers={"Content-Type": "application/json"}), timeout=20)
-        except Exception as e:
-            print("Telegram failed:", type(e).__name__)
-
-
-def track(df, lists, nv):
-    """Save today's picks, score older picks vs Nifty 50, and list what changed since last run."""
-    hist = json.load(open("docs/history.json")) if os.path.exists("docs/history.json") else []
-    today = dt.datetime.now(IST).date()
-    hist = [h for h in hist if h["d"] != today.isoformat()]
-    rows = []
-    for name in ("short", "long", "weak", "pick"):
-        for lb in (7, 28, 84):
-            rs, ex = [], []
-            for h in hist:
-                if (today - dt.date.fromisoformat(h["d"])).days < lb or not h.get("nifty") or not nv:
-                    continue
-                cur = [df.price[k] / p - 1 for k, p in h.get(name, {}).items() if k in df.index]
-                if cur:
-                    r = float(np.mean(cur)) * 100
-                    rs.append(r); ex.append(r - (nv / h["nifty"] - 1) * 100)
-            if rs:
-                rows.append(dict(list=name, days=lb, runs=len(rs), avg=clean(np.mean(rs)), excess=clean(np.mean(ex))))
-    prev = hist[-1] if hist else None
-    msg = ""
-    if prev:
-        for name, label in (("pick", "Shortlist"), ("short", "Short-term"), ("long", "Long-term"), ("weak", "Weak")):
-            new, gone = set(lists[name]) - set(prev.get(name, [])), set(prev.get(name, [])) - set(lists[name])
-            if new or gone:
-                msg += f"{label}: " + (f"+ {', '.join(sorted(new))} " if new else "") + (f"- {', '.join(sorted(gone))}" if gone else "") + "\n"
-    hist.append(dict(d=today.isoformat(), nifty=nv, **{k: {s: round(float(df.price[s]), 2) for s in v} for k, v in lists.items()}))
-    os.makedirs("docs", exist_ok=True)
-    json.dump(hist[-400:], open("docs/history.json", "w"))
-    return rows, msg
-
-
-def since(df, picks, nv):
-    """For each current pick: when it first appeared on the shortlist, and how it did since."""
-    hist = json.load(open("docs/history.json")) if os.path.exists("docs/history.json") else []
+def prices_from(cl):
+    """Build {symbol: (end_price, base_price, end_date)} for the current mode."""
     out = {}
-    for s in picks:
-        h = next((h for h in hist if s in h.get("pick", {})), None)
-        if h and h.get("nifty") and nv:
-            p = h["pick"][s]
-            out[s] = dict(first=h["d"], since_ret=clean((df.price[s] / p - 1) * 100), vs=clean((df.price[s] / p - 1) * 100 - (nv / h["nifty"] - 1) * 100))
+    today = dt.datetime.now(IST).date()
+    first_this = today.replace(day=1)
+    first_prev = (first_this - dt.timedelta(days=1)).replace(day=1)
+    for s, c in cl.items():
+        try:
+            if MODE in ("hourly", "alert"):
+                out[s] = (float(c.iloc[-1]), float(c.iloc[-2]), c.index[-1].date())
+            elif MODE == "weekly":
+                if len(c) >= 6:
+                    out[s] = (float(c.iloc[-1]), float(c.iloc[-6]), c.index[-1].date())
+            elif MODE == "monthly":
+                d = pd.Series(c.values, index=[x.date() for x in c.index])
+                end = d[d.index < first_this]
+                base = d[d.index < first_prev]
+                if base.empty:
+                    base = d[d.index >= first_prev]
+                if len(end) and len(base):
+                    out[s] = (float(end.iloc[-1]), float(base.iloc[-1] if len(base) else base.iloc[0]), end.index[-1])
+        except Exception:
+            pass
     return out
 
 
-def pr(s, higher=True):
-    return s.rank(pct=True, ascending=higher) * 100
+def build(df, prices):
+    df = df[df.trading_symbol.isin(prices)].copy()
+    df["ltp"] = df.trading_symbol.map(lambda s: prices[s][0])
+    df["prev"] = df.trading_symbol.map(lambda s: prices[s][1])
+    df["day_pct"] = (df.ltp / df.prev - 1) * 100
+    df["day_pnl"] = (df.ltp - df.prev) * df.quantity
+    df["value"] = df.ltp * df.quantity
+    df["invested"] = df.average_price * df.quantity
+    df["total_pnl"] = df.value - df.invested
+    df["total_pct"] = df.total_pnl / df.invested * 100
+    return df
 
 
-def fundamentals(sym):
+def hour_change(df, now):
+    """Change over roughly the last hour of trading (stateless, from 15-min bars)."""
+    t = pd.Timestamp(now)
+    t = min(t, t.normalize().replace(hour=15, minute=30))
+    ref = t - pd.Timedelta(minutes=60)
+    intra = closes(list(df.trading_symbol), period="1d", interval="15m")
+    refp = {}
+    for s, c in intra.items():
+        cut = ref if c.index.tz is not None else ref.tz_localize(None)
+        e = c[c.index <= cut]
+        if len(e):
+            refp[s] = float(e.iloc[-1])
+    if len(refp) < 5:
+        return None
+    h = df[df.trading_symbol.isin(refp)].copy()
+    h["h_ref"] = h.trading_symbol.map(refp)
+    h["h_pct"] = (h.ltp / h.h_ref - 1) * 100
+    h["h_pnl"] = (h.ltp - h.h_ref) * h.quantity
+    return h
+
+
+def hour_totals(hr):
+    pnl = hr.h_pnl.sum()
+    base = (hr.h_ref * hr.quantity).sum()
+    return pnl, pnl / base * 100
+
+
+def colr(x):
+    return "#0a8a3a" if x >= 0 else "#d0302f"
+
+
+def _tbl(title, head, rows):
+    rows = rows.replace("<tr>", "<tr style='border-bottom:1px solid #e6e8eb'>").replace("<td", "<td style='padding:7px 6px'", 1) if False else rows.replace("<tr>", "<tr style='border-bottom:1px solid #e6e8eb'>")
+    return (f"<h3 style='margin:20px 0 6px;font-size:15px;border-left:4px solid #2557d6;padding-left:8px'>{title}</h3><div style='overflow-x:auto'><table cellpadding=6 width=100% style='border-collapse:collapse;font-size:13px'>"
+            f"<tr style='background:#f1f3f5;color:#555;font-size:12px'>{head}</tr>{rows}</table></div>")
+
+
+def table_hr(d, title):
+    rows = "".join(
+        f"<tr><td>{r.trading_symbol}</td><td align=right>{inr(r.ltp, dec=2, sym='')}</td>"
+        f"<td align=right style='color:{colr(r.h_pct)}'>{r.h_pct:+.2f}%</td>"
+        f"<td align=right>{inr(r.h_pnl, True)}</td></tr>" for r in d.itertuples())
+    return _tbl(title, "<th align=left>Stock</th><th>Price</th><th>Hour %</th><th>Hour ₹</th>", rows)
+
+
+def table_ret(d, title):
+    rows = "".join(
+        f"<tr><td>{r.trading_symbol}</td><td align=right>{inr(r.average_price, dec=2, sym='')}</td>"
+        f"<td align=right>{inr(r.ltp, dec=2, sym='')}</td>"
+        f"<td align=right style='color:{colr(r.total_pct)}'>{r.total_pct:+.1f}%</td>"
+        f"<td align=right>{inr(r.total_pnl, True)}</td></tr>" for r in d.itertuples())
+    return _tbl(title, "<th align=left>Stock</th><th>Avg buy</th><th>Price</th><th>Return %</th><th>P&amp;L ₹</th>", rows)
+
+
+def table_conc(d, total, title):
+    rows = "".join(
+        f"<tr><td>{'⚠️ ' if r.value/total*100 > CONC_WARN else ''}{r.trading_symbol}</td>"
+        f"<td align=right>{inr(r.value)}</td><td align=right><b>{r.value/total*100:.1f}%</b></td>"
+        f"<td align=right style='color:{colr(r.total_pct)}'>{r.total_pct:+.1f}%</td></tr>" for r in d.itertuples())
+    return _tbl(title, "<th align=left>Stock</th><th>Value</th><th>Share</th><th>Return %</th>", rows)
+
+
+def table(d, title):
+    g = lambda x: "#0a8a3a" if x >= 0 else "#d0302f"
+    lab = {"weekly": "This week", "monthly": "This month"}.get(MODE, "Today")
+    rows = "".join(
+        "<tr style='border-bottom:1px solid #e6e8eb'>"
+        f"<td style='padding:8px 6px'><b style='font-size:15px'>{r.trading_symbol}</b><br>"
+        f"<span style='color:#777;font-size:12px'>{r.quantity:g} sh · avg {inr(r.average_price, dec=2, sym='')} → {inr(r.ltp, dec=2, sym='')}</span></td>"
+        f"<td align=right style='padding:8px 6px;color:{g(r.day_pct)}'><b>{r.day_pct:+.2f}%</b><br><span style='font-size:12px'>{inr(r.day_pnl, True)}</span></td>"
+        f"<td align=right style='padding:8px 6px;color:{g(r.total_pnl)}'><b>{inr(r.total_pnl, True)}</b><br><span style='font-size:12px'>{r.total_pct:+.1f}%</span></td></tr>"
+        for r in d.itertuples())
+    return (f"<h3 style='margin:20px 0 6px;font-size:15px;border-left:4px solid #2557d6;padding-left:8px'>{title}</h3><table width=100% style='border-collapse:collapse;font-size:13px'>"
+            f"<tr style='background:#f1f3f5;color:#555;font-size:12px'><th align=left style='padding:6px'>Stock · shares · avg → price</th>"
+            f"<th align=right style='padding:6px'>{lab}</th><th align=right style='padding:6px'>Overall return</th></tr>{rows}</table>")
+
+
+def html_report(df, missing, now, heading, period, unpriced=None, hr=None):
+    dp = df.day_pnl.sum()
+    dpct = dp / (df.value.sum() - dp) * 100
+    cost = float((unpriced.quantity * unpriced.average_price).sum()) if unpriced is not None and len(unpriced) else 0.0
+    v, inv = df.value.sum() + cost, df.invested.sum() + cost
+    up, down = int((df.day_pct > 0).sum()), int((df.day_pct < 0).sum())
+    col = "#0a8a3a" if dp >= 0 else "#d0302f"
+    hr_p, hr_pct = hour_totals(hr) if hr is not None else (0, 0)
+    card = lambda label, val, sub="", c="#111": (f"<td width=50% style='background:#f6f7f9;border-radius:8px;padding:10px 12px'>"
+        f"<div style='color:#777;font-size:12px'>{label}</div><div style='font-size:19px;font-weight:bold;color:{c}'>{val}</div>"
+        f"<div style='font-size:12px;color:{c}'>{sub or '&nbsp;'}</div></td>")
+    h = (f"<div style='font-family:Arial,sans-serif;max-width:640px;margin:auto;color:#111'>"
+         f"<h2 style='margin:0'>{heading}</h2><div style='color:#777;font-size:12px;margin-bottom:8px'>{now:%d %b %Y, %I:%M %p} IST</div>"
+         f"<table width=100% cellspacing=6 style='border-collapse:separate'><tr>{card('Invested', inr(inv))}{card('Current value', inr(v))}</tr>"
+         f"<tr>{card('Overall P&amp;L', inr(v-inv, True), f'{(v/inv-1)*100:+.2f}%', colr(v-inv))}{card(period, inr(dp, True), f'{dpct:+.2f}%', col)}</tr></table>"
+         + (f"<div style='font-size:13px;color:{colr(hr_p)};margin:2px 0'><b>Last hour: {inr(hr_p, True)} ({hr_pct:+.2f}%)</b></div>" if hr is not None else "")
+         + f"<div style='font-size:13px;color:#555'>{up} stocks up · {down} down · {len(df)-up-down} flat</div>")
+    h += table(df.nlargest(TOP_N, "day_pct"), f"🟢 Top {TOP_N} gainers (%)")
+    h += table(df.nsmallest(TOP_N, "day_pct"), f"🔴 Top {TOP_N} losers (%)")
+    h += table(df.nlargest(TOP_N, "day_pnl"), f"💰 Top {TOP_N} ₹ contributors")
+    h += table(df.nsmallest(TOP_N, "day_pnl"), f"📉 Top {TOP_N} ₹ drags")
+    t = BIG_MOVE.get(MODE, 5)
+    big = df[df.day_pct.abs() >= t]
+    if len(big):
+        h += table(big.sort_values("day_pct"), f"⚠️ Moves of {t:g}% or more")
+    if hr is not None:
+        h += table_hr(hr.nlargest(HR_N, "h_pct"), f"⏱️ Last hour: top {HR_N} gainers")
+        h += table_hr(hr.nsmallest(HR_N, "h_pct"), f"⏱️ Last hour: top {HR_N} losers")
+    h += table_ret(df.nlargest(TOP_N, "total_pct"), f"🏆 Since you bought: top {TOP_N} winners")
+    h += table_ret(df.nsmallest(TOP_N, "total_pct"), f"🧊 Since you bought: bottom {TOP_N}")
+    top = df.nlargest(10, "value")
+    h += (f"<h3>🎯 Concentration: top 10 holdings = {top.value.sum()/v*100:.1f}% of portfolio</h3>"
+          f"<p style='color:#888;margin:0'>⚠️ marks a stock above {CONC_WARN:g}% of your portfolio</p>")
+    h += table_conc(top, v, "Largest holdings")
+    if MODE in ("weekly", "monthly"):
+        h += "<p style='color:#888'>Based on your current holdings and quantities.</p>"
+    if missing:
+        h += (f"<p style='color:#888'>No live price for: {', '.join(missing)}. "
+              f"Counted at your buy price ({inr(cost)}), so they don't affect P&amp;L or today's change.</p>")
+    return h + "</div>"
+
+
+def tg_send(text):
+    """Send a Telegram message (skipped if the two Telegram secrets are not set)."""
+    token, chat = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(), os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat:
+        return
     try:
-        i = yf.Ticker(sym + ".NS").info
-        return dict(roe=i.get("returnOnEquity"), de=i.get("debtToEquity"), eg=i.get("earningsGrowth"),
-                    pm=i.get("profitMargins"))
-    except Exception:
-        return {}
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=json.dumps({"chat_id": chat, "text": text[:4000]}).encode(),
+            headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=20).read()
+    except Exception as e:  # never let Telegram problems stop the email
+        print("Telegram failed:", type(e).__name__)
 
 
-def clean(v):
-    if isinstance(v, (np.floating, float)):
-        return None if v != v else round(float(v), 2)
-    if isinstance(v, (np.bool_, bool)):
-        return bool(v)
-    return v
+def send(html, subject, tg=None, email=True):
+    if email and html:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"], msg["From"], msg["To"] = subject, os.environ["GMAIL_USER"], os.environ["EMAIL_TO"]
+        msg.attach(MIMEText(html, "html"))
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+            s.login(os.environ["GMAIL_USER"], os.environ["GMAIL_APP_PASSWORD"])
+            s.send_message(msg)
+    if tg:
+        tg_send(tg)
+
+
+def tg_summary(df, now, heading, period, unpriced=None, hr=None):
+    dp = df.day_pnl.sum()
+    dpct = dp / (df.value.sum() - dp) * 100
+    cost = float((unpriced.quantity * unpriced.average_price).sum()) if unpriced is not None and len(unpriced) else 0.0
+    v, inv = df.value.sum() + cost, df.invested.sum() + cost
+    up, down = int((df.day_pct > 0).sum()), int((df.day_pct < 0).sum())
+    line = lambda r: (f"{r.trading_symbol}  {r.day_pct:+.2f}%  ({inr(r.day_pnl, True)})\n"
+                      f"   {r.quantity:g} sh · avg {inr(r.average_price, dec=2)} → {inr(r.ltp, dec=2)} · return {inr(r.total_pnl, True)} ({r.total_pct:+.1f}%)")
+    return (f"📊 {heading} · {now:%d %b, %I:%M %p}\n\n"
+            f"Invested: {inr(inv)}\nCurrent Value: {inr(v)}\n"
+            f"Overall P&L: {inr(v-inv, True)} ({(v/inv-1)*100:+.2f}%)\n"
+            f"{period}: {inr(dp, True)} ({dpct:+.2f}%)\n"
+            + (f"Last hour: {inr(hour_totals(hr)[0], True)} ({hour_totals(hr)[1]:+.2f}%)\n" if hr is not None else "")
+            + f"{up} up · {down} down · {len(df)-up-down} flat\n\n"
+            f"🟢 Top {TOP_N} gainers\n" + "\n".join(line(r) for r in df.nlargest(TOP_N, "day_pct").itertuples()) +
+            f"\n\n🔴 Top {TOP_N} losers\n" + "\n".join(line(r) for r in df.nsmallest(TOP_N, "day_pct").itertuples()))
+
+
+def run_alert(df, now):
+    """Alert only for stocks that JUST crossed the threshold (not ones already past it 25+ min ago)."""
+    hits = df[df.day_pct.abs() >= ALERT_PCT]
+    if hits.empty:
+        print("No stock beyond threshold.")
+        return
+    intra = closes(list(hits.trading_symbol), period="1d", interval="5m")
+    new = []
+    for r in hits.itertuples():
+        c = intra.get(r.trading_symbol)
+        fresh = True
+        if c is not None:
+            cutoff = pd.Timestamp(now)
+            if c.index.tz is None:
+                cutoff = cutoff.tz_localize(None)
+            earlier = c[c.index <= cutoff - pd.Timedelta(minutes=25)]
+            if len(earlier):
+                pct_then = (float(earlier.iloc[-1]) / r.prev - 1) * 100
+                fresh = abs(pct_then) < ALERT_PCT
+        if fresh:
+            new.append(r.Index)
+    if not new:
+        print("Moves already alerted earlier.")
+        return
+    d = hits.loc[new].sort_values("day_pct")
+    rows = "".join(
+        f"<tr><td><b>{r.trading_symbol}</b></td><td align=right>{inr(r.ltp, dec=2, sym='')}</td>"
+        f"<td align=right style='color:{'#0a8a3a' if r.day_pct>=0 else '#d0302f'}'><b>{r.day_pct:+.2f}%</b></td>"
+        f"<td align=right>{inr(r.day_pnl, True)}</td><td align=right>{inr(r.value)}</td></tr>" for r in d.itertuples())
+    html = (f"<div style='font-family:Arial'><h2>🚨 Price alert · {now:%d %b, %I:%M %p} IST</h2>"
+            f"<p>Moved {ALERT_PCT:g}% or more today:</p>"
+            f"<table cellpadding=5 style='border-collapse:collapse;font-size:14px'>"
+            f"<tr style='background:#eee'><th align=left>Stock</th><th>Price</th><th>Day %</th><th>Impact ₹</th><th>Holding ₹</th></tr>"
+            f"{rows}</table></div>")
+    names = ", ".join(f"{r.trading_symbol} {r.day_pct:+.1f}%" for r in d.itertuples())
+    tg = f"🚨 Price alert · {now:%d %b, %I:%M %p}\n\n" + "\n".join(
+        f"{r.trading_symbol}  {r.day_pct:+.2f}%  @ {inr(r.ltp, dec=2, sym='₹')}  (impact {inr(r.day_pnl, True)})" for r in d.itertuples())
+    send(html, f"🚨 Alert: {names}"[:150], tg)
+    print("Alert sent:", names)
+
+
+def run_review(holdings, now):
+    """Compare your holdings with the public Nifty 500 scanner results."""
+    url = os.environ.get("SCANNER_DATA_URL", "").strip()
+    if not url:
+        sys.exit("SCANNER_DATA_URL secret is missing")
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    data = json.load(urllib.request.urlopen(req, timeout=30))
+    info = {r["symbol"]: r for r in data["all"]}
+    rows = []
+    for r in holdings.itertuples():
+        i = info.get(r.trading_symbol)
+        if i and i.get("price"):
+            rows.append(dict(sym=r.trading_symbol, value=r.quantity * i["price"], mine=(i["price"] / r.average_price - 1) * 100,
+                             r6=i.get("ret6m"), off=i.get("from_high"), tag=i.get("tag") or ""))
+    d = pd.DataFrame(rows)
+    skipped = len(holdings) - len(d)
+    weak = d[d.tag == "weak"].sort_values("value", ascending=False).head(15) if len(d) else d
+    strong = d[d.tag.isin(["short", "long"])].sort_values("value", ascending=False) if len(d) else d
+    owned = set(holdings.trading_symbol)
+    ideas = lambda k: [x for x in data[k] if x["symbol"] not in owned][:5]
+    f = lambda x: "–" if x is None or x != x else f"{x:+.0f}%"
+    wl = lambda r: f"{r.sym}  {inr(r.value)}  | you {r.mine:+.0f}%  | 6M {f(r.r6)}  | {f(r.off)} from high"
+    il = lambda x: f"{x['symbol']}  {x['ret3m']:+.0f}% 3M  ({x.get('note') or x['industry']})"
+    tg = (f"🔎 Weekly portfolio review · {now:%d %b}\nScanner data: {data['generated']}\n\n"
+          f"⚠️ Holdings looking weak ({len(weak)}):\n" + ("\n".join(wl(r) for r in weak.itertuples()) or "None") +
+          f"\n\n✅ Holdings on strong lists ({len(strong)}):\n" + ("\n".join(f"{r.sym} ({r.tag}-term)" for r in strong.itertuples()) or "None") +
+          "\n\n💡 Short-term ideas you don't own:\n" + "\n".join(il(x) for x in ideas("short")) +
+          "\n\n💡 Long-term ideas you don't own:\n" + "\n".join(il(x) for x in ideas("long")) +
+          (f"\n\n{skipped} holdings not in Nifty 500 (not scanned)." if skipped else "") +
+          "\n\nScreens, not advice. Weak = below 200-day average, down over 6M, 25%+ off its high.")
+    esc = lambda t: t.replace("&", "&amp;").replace("<", "&lt;").replace("\n", "<br>")
+    send(f"<div style='font-family:Arial'>{esc(tg)}</div>", f"Weekly review: {len(weak)} weak, {len(strong)} strong holdings", tg)
+    print("Review sent.")
 
 
 def main():
-    uni = universe()
-    uni["Symbol"] = uni["Symbol"].astype(str).str.strip()
-    px = prices(list(uni.Symbol))
-    print(f"Prices for {len(px)} of {len(uni)} stocks")
-    if len(px) < 100:
-        raise SystemExit("Too little price data, aborting so the old dashboard stays.")
-    df = pd.DataFrame({s: metrics(x) for s, x in px.items()}).T
-    for col in df.columns:
-        if col in ("above50", "above200"):
-            df[col] = df[col].astype(bool)
-        else:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    meta = uni.set_index("Symbol")
-    df["name"] = [meta["Company Name"].get(s, s) for s in df.index]
-    df["industry"] = [meta["Industry"].get(s, "") for s in df.index]
-    liquid = df.turnover >= 1
+    now = dt.datetime.now(IST)
+    holdings = get_holdings()
+    if MODE == "review":
+        run_review(holdings, now)
+        return
+    syms = list(holdings.trading_symbol)
+    period = {"hourly": "7d", "alert": "7d", "weekly": "1mo", "monthly": "3mo"}[MODE]
+    cl = closes(syms, period)
+    prices = prices_from(cl)
+    if not prices:
+        sys.exit("No prices fetched")
+    if MODE in ("hourly", "alert") and not os.environ.get("FORCE"):
+        if max(p[2] for p in prices.values()) != now.date():
+            print("Market closed today, skipping.")
+            return
+    df = build(holdings, prices)
+    if MODE == "alert":
+        run_alert(df, now)
+        return
+    missing = sorted(set(syms) - set(prices))
+    dp = df.day_pnl.sum()
+    arrow = "▲" if dp >= 0 else "▼"
+    is_close = now.hour >= 16
+    hr = None
+    if MODE == "hourly" and now.hour >= 10:
+        try:
+            hr = hour_change(df, now)
+        except Exception as e:
+            print("Last-hour calc failed:", type(e).__name__)
+    if MODE == "hourly":
+        heading, label = ("Closing report", "Today") if is_close else ("Portfolio update", "Today")
+        subject = (f"Closing report {arrow} {inr(dp, True)} · {now:%d %b}" if is_close
+                   else f"Portfolio {arrow} {inr(dp, True)} today · {now:%d %b %H:%M}")
+    elif MODE == "weekly":
+        heading, label = "Weekly report", "This week"
+        subject = f"Weekly report {arrow} {inr(dp, True)} · week to {now:%d %b}"
+    else:
+        last = (now.date().replace(day=1) - dt.timedelta(days=1))
+        heading, label = f"Monthly report ({last:%B %Y})", last.strftime("%B")
+        subject = f"Monthly report {last:%b %Y} {arrow} {inr(dp, True)}"
+    unpriced = holdings[holdings.trading_symbol.isin(missing)]
+    # Hourly: Telegram every run, full email only at the close (or on a manual test run)
+    want_email = MODE != "hourly" or is_close or bool(os.environ.get("FORCE"))
+    html = html_report(df, missing, now, heading, label, unpriced, hr) if want_email else None
+    send(html, subject, tg_summary(df, now, heading, label, unpriced, hr), want_email)
+    print("Sent.")
 
-    # Short-term: momentum + rising volume + near highs, above 50-day average
-    df["short"] = 0.30 * pr(df.ret1m) + 0.25 * pr(df.ret3m) + 0.25 * pr(df.vol_surge) + 0.20 * pr(df.from_high)
-    short = df[liquid & df.above50].nlargest(N, "short").copy()
-    short["score"] = short.short
-    short["note"] = np.where(short.ret1m > 25, "⚠️ stretched, up fast", "")
-
-    # Long-term: strong steady trend, then check profitability on the best 60
-    df["trend"] = 0.4 * pr(df.ret12m) + 0.3 * pr(df.maxdd) + 0.3 * pr(df.from_high)
-    pool = df[liquid & df.above200 & (df.ret12m > 0) & (df.ret6m > 0)].nlargest(60, "trend").copy()
-    fund = {s: fundamentals(s) for s in pool.index}
-    f = pd.DataFrame(fund).T.reindex(index=pool.index, columns=["roe", "de", "eg", "pm"])
-    for col in f.columns:
-        f[col] = pd.to_numeric(f[col], errors="coerce")
-    fin = pool.industry.str.contains("Financial", case=False, na=False)
-    f.loc[fin, "de"] = np.nan  # debt/equity is not meaningful for banks and lenders
-    q = pd.concat([pr(f.roe), pr(f.eg), pr(f.pm), pr(f.de, higher=False)], axis=1)
-    pool["quality"] = q.mean(axis=1)
-    pool["nq"] = q.notna().sum(axis=1)
-    pool["score"] = np.where(pool.nq >= 2, 0.5 * pool.trend + 0.5 * pool.quality, 0.6 * pool.trend)
-    pool["note"] = [("ROE %.0f%%" % (f.roe[s] * 100) if f.roe[s] == f.roe[s] else "fundamentals n/a") for s in pool.index]
-    long_ = pool.nlargest(N, "score")
-
-    # Weak / neglected: below long-term average, falling, far from highs
-    df["weak"] = 100 - (0.30 * pr(df.ret3m) + 0.25 * pr(df.ret6m) + 0.25 * pr(df.from_high) + 0.20 * pr(df.dist200))
-    df["weak_flag"] = (~df.above200) & (df.ret6m < 0) & (df.from_high < -25)
-    weak = df[liquid & ~df.above200 & (df.ret6m < 0)].nlargest(N, "weak").copy()
-    weak["score"] = weak.weak
-    weak["note"] = [", ".join(filter(None, ["below 200-day avg", "%.0f%% off high" % -r.from_high,
-                    "volume fading" if r.vol_surge < 0.8 else ""])) for r in weak.itertuples()]
-
-    sec = df.groupby("industry").agg(stocks=("price", "size"), ret1m=("ret1m", "median"), ret3m=("ret3m", "median"),
-                                      above200=("above200", "mean")).reset_index()
-    sec["above200"] = sec.above200 * 100
-    sec = sec[sec.stocks >= 3].sort_values("ret3m", ascending=False)
-
-    tag = {s: "short" for s in short.index}
-    tag.update({s: "long" for s in long_.index})
-    tag.update({s: "weak" for s in df.index[df.weak_flag]})  # weak flag wins
-    df["tag"] = [tag.get(s, "") for s in df.index]
-    df["symbol"] = df.index
-    nv, nup = nifty()
-    mkt3 = df.ret3m.median()
-    df["sec3m"] = df.industry.map(sec.set_index("industry").ret3m)
-    cand = pool[(df.reindex(pool.index).turnover >= 5) & df.reindex(pool.index).above50].copy()
-    d = df.reindex(cand.index)
-    keep = (d.ret3m > mkt3) & (d.ret1m < 20) & (d.dist50 < 15) & (d.maxdd > -35) & (d.vol_surge >= 0.9) & (d.sec3m > mkt3)
-    cand = cand[keep.values]
-    cand["final"] = 0.5 * cand.score + 0.5 * df.short.reindex(cand.index)
-    sl = cand.nlargest(N, "final")
-    f_roe = f.roe.reindex(sl.index)
-    shortlist = []
-    for s_, r in sl.iterrows():
-        x = df.loc[s_]
-        why = [f"beats the median stock by {x.ret3m - mkt3:.0f} pts over 3M", "above 50 and 200-day averages",
-               f"sector leading (3M median {x.sec3m:+.0f}%)", f"volume {x.vol_surge:.1f}x normal",
-               f"ROE {f_roe[s_] * 100:.0f}%" if f_roe[s_] == f_roe[s_] else None]
-        risks = [t for t in ["fundamentals n/a" if r.nq < 2 else None, "up fast this month" if x.ret1m > 12 else None,
-                             f"volatile (1y drawdown {x.maxdd:.0f}%)" if x.maxdd < -25 else None,
-                             "market mood weak" if (nup is False and df.above200.mean() * 100 < 45) else None] if t]
-        shortlist.append(dict(symbol=s_, name=x["name"], industry=x.industry, price=clean(x.price), score=clean(r.final),
-                              why="; ".join(w for w in why if w), risks="; ".join(risks) or "none flagged",
-                              lv=f"50-day avg ₹{x.ma50:.0f}" + (f", 200-day avg ₹{x.ma200:.0f}" if x.ma200 == x.ma200 else "")))
-    b200 = df.above200.mean() * 100
-    mood = ("Weak", "Market looks weak: Nifty is below its 200-day average and few stocks are above theirs. Momentum picks fail more often in falling markets.") if (nup is False and b200 < 45) else \
-           ("Healthy", "Market looks healthy: Nifty is above its 200-day average and most stocks are in uptrends.") if (nup and b200 >= 55) else \
-           ("Mixed", "Market is mixed. Be selective and check each pick yourself.")
-    sinc = since(df, list(sl.index), nv)
-    for r in shortlist:
-        r.update(sinc.get(r['symbol'], dict(first=None, since_ret=None, vs=None)))
-    trk, chg = track(df, dict(pick=list(sl.index), short=list(short.index), long=list(long_.index), weak=list(weak.index)), nv)
-    if chg:
-        tg_send("📊 Scanner changes " + dt.datetime.now(IST).strftime("%d %b") + "\n" + chg + "(+ new, - dropped)\nMarket mood: " + mood[0])
-    longest = max(px.values(), key=len)
-    sdates = [d.strftime("%d %b %y") for d in longest.index[::-5][::-1]]
-    df["spark"] = [[round(float(v), 1) for v in px[s].Close.iloc[::-5][::-1]] for s in df.index]
-    cols = ["symbol", "spark", "name", "industry", "price", "day", "ret1m", "ret3m", "ret6m", "ret12m", "from_high",
-            "vol_surge", "dist200", "weak_flag", "tag"]
-    rows = lambda d, extra=("score", "note"): [{k: clean(v) for k, v in r.items()} for r in
-                                               d.assign(symbol=d.index)[["symbol", "name", "industry", "price", "ret1m", "ret3m",
-                                                                         "ret6m", "from_high", "vol_surge", *extra]].to_dict("records")]
-    out = dict(
-        generated=dt.datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST"), scanned=len(df),
-        breadth=dict(above50=clean(df.above50.mean() * 100), above200=clean(df.above200.mean() * 100),
-                     advancers=clean((df.day > 0).mean() * 100), median1m=clean(df.ret1m.median()),
-                     median3m=clean(df.ret3m.median())),
-        mood=dict(label=mood[0], text=mood[1]), track=trk, sdates=sdates, shortlist=shortlist,
-        short=rows(short), long=rows(long_), weak=rows(weak),
-        sectors=[{k: clean(v) for k, v in r.items()} for r in sec.to_dict("records")],
-        all=[{k: clean(v) for k, v in r.items()} for r in df[cols].to_dict("records")])
-    os.makedirs("docs", exist_ok=True)
-    js = json.dumps(out, ensure_ascii=False, allow_nan=False)
-    open("docs/data.json", "w", encoding="utf-8").write(js)
-    open("docs/index.html", "w", encoding="utf-8").write(HTML.replace("__DATA__", js.replace("</", "<\\/")))
-    print("Done:", out["generated"])
-
-
-HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1"><title>Nifty 500 Scanner</title>
-<style>
-:root{--bg:#fff;--fg:#1a1a1a;--mut:#666;--card:#f2f3f5;--up:#0a8a3a;--dn:#d0302f;--ac:#2557d6}
-@media(prefers-color-scheme:dark){:root{--bg:#111;--fg:#eee;--mut:#999;--card:#1d1f23;--up:#3ddc84;--dn:#ff6b6b;--ac:#7aa2ff}}
-body{font:14px system-ui,sans-serif;background:var(--bg);color:var(--fg);margin:auto;padding:12px;max-width:1100px}
-h1{font-size:20px;margin:4px 0}.m{color:var(--mut);font-size:12px}
-.cards{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0}.c{background:var(--card);border-radius:8px;padding:8px 12px}
-.c b{display:block;font-size:18px}
-.tabs button{background:var(--card);color:var(--fg);border:0;padding:8px 12px;margin:2px;border-radius:6px;cursor:pointer}
-.tabs button.on{background:var(--ac);color:#fff}
-.w{overflow-x:auto}table{border-collapse:collapse;width:100%;margin-top:8px}
-th,td{padding:6px 8px;text-align:right;white-space:nowrap;border-bottom:1px solid var(--card)}
-th:first-child,td:first-child,td:nth-child(2){text-align:left}th{cursor:pointer;color:var(--mut)}
-.wr{white-space:normal;min-width:180px;text-align:left}.st{cursor:pointer;color:#e0a800}.lk{color:var(--ac);cursor:pointer;text-decoration:underline}#md{display:none;position:fixed;inset:0;background:#0008;padding:16px;overflow:auto}#md div{background:var(--bg);max-width:420px;margin:auto;padding:14px;border-radius:10px}
-.up{color:var(--up)}.dn{color:var(--dn)}input{width:100%;padding:8px;box-sizing:border-box;margin-top:8px}
-</style></head><body>
-<h1>Nifty 500 Scanner</h1><div class=m id=gen></div><div id=mood class=c></div><div class=cards id=br></div>
-<div id=md></div><div class=tabs id=tabs></div><div id=out></div>
-<p class=m>Data from Yahoo Finance, computed by a free script. Rankings are statistical screens, not investment advice or predictions.
-Check a company's business, valuation and news yourself before acting.</p>
-<script id=d type=application/json>__DATA__</script>
-<script>
-const D=JSON.parse(document.getElementById('d').textContent);
-const F=(x,d)=>x==null?'–':(+x).toFixed(d),C=x=>x==null?'':x>=0?'up':'dn';
-const S=[['Stock','symbol'],['Industry','industry'],['Price','price',2,'',0],['1M','ret1m',1,'%',1],['3M','ret3m',1,'%',1],
-['6M','ret6m',1,'%',1],['vs 52w high','from_high',1,'%',1],['Vol ×','vol_surge',2,'×',0],['Score','score',0,'',0],['Note','note']];
-const A=S.filter(c=>c[1]!='score'&&c[1]!='note').concat([['Tag','tag']]);
-const SEC=[['Industry','industry'],['Stocks','stocks',0,'',0],['1M median','ret1m',1,'%',1],['3M median','ret3m',1,'%',1],['% above 200-day','above200',0,'%',0]];
-const W=new Set(),K='wl';try{JSON.parse(localStorage.getItem(K)||'[]').forEach(x=>W.add(x))}catch(e){}
-const save=()=>{try{localStorage.setItem(K,JSON.stringify([...W]))}catch(e){}};
-function T(rows,cols){return '<div class=w><table><tr>'+cols.map(c=>'<th data-k="'+c[1]+'">'+c[0]+'</th>').join('')+'</tr>'+
-rows.map(r=>'<tr>'+cols.map(c=>{const v=r[c[1]];return c[1]=='symbol'?'<td title="'+(r.name||'')+'"><span class=st data-s="'+v+'">'+(W.has(v)?'★':'☆')+'</span> <a class=lk data-s="'+v+'">'+v+'</a></td>':c[2]===undefined?'<td class="'+(['why','risks','lv'].includes(c[1])?'wr':'')+'" title="'+(r.name||'')+'">'+(v??'')+'</td>':
-'<td class="'+(c[4]?C(v):'')+'">'+F(v,c[2])+(v==null?'':c[3])+'</td>'}).join('')+'</tr>').join('')+'</table></div>'}
-document.getElementById('gen').textContent='Updated '+D.generated+' · '+D.scanned+' stocks scanned';
-const b=D.breadth;document.getElementById('br').innerHTML=[['Above 50-day',F(b.above50,0)+'%'],['Above 200-day',F(b.above200,0)+'%'],
-['Up today',F(b.advancers,0)+'%'],['Median 1M',F(b.median1m,1)+'%'],['Median 3M',F(b.median3m,1)+'%']].map(x=>'<div class=c>'+x[0]+'<b>'+x[1]+'</b></div>').join('');
-const TR=[['List','list'],['Picks at least (days old)','days',0,'',0],['Days sampled','runs',0,'',0],['Avg return since listed','avg',1,'%',1],['vs Nifty 50','excess',1,'%',1]];
-const SL=[['Stock','symbol'],['Price','price',2,'',0],['Score','score',0,'',0],['Listed since','first'],['Since listed','since_ret',1,'%',1],['vs Nifty 50','vs',1,'%',1],['Why it passed','why'],['Risks','risks'],['Reference levels','lv']];
-const TABS={'Research shortlist':()=>'<p class=m><b>Research shortlist, not buy advice.</b> A rules-based screen: strong 3M momentum vs the median stock, above 50 and 200-day averages, leading sector, healthy volume, not up too fast, shallow drawdown, plus Yahoo profitability data. Built by an AI, not a SEBI-registered advisor. It cannot see news, results or valuation, so check each company yourself. Reference levels are chart points, not stop-loss advice.</p>'+(D.shortlist.length?T(D.shortlist,SL):'<p>No stock passes all the filters today. That is a valid result.</p>'),
-'Watchlist':()=>W.size?T(D.all.filter(x=>W.has(x.symbol)),A):'<p class=m>Tap ☆ next to a stock to add it here. Saved in this browser only.</p>',
-'Track record':()=>(D.track.length?T(D.track,TR):'<p class=m>Needs a few weeks of daily history.</p>')+'<p class=m>Average return of past picks since they were listed, versus the Nifty 50. Early numbers are noisy.</p>','Short-term':()=>T(D.short,S),'Long-term':()=>T(D.long,S),'Weak / fading':()=>T(D.weak,S),
-'Sectors':()=>T(D.sectors,SEC),'All stocks':null};
-let cur='Research shortlist',sk='ret3m',sd=-1;
-function show(){document.getElementById('tabs').innerHTML=Object.keys(TABS).map(k=>'<button class="'+(k==cur?'on':'')+'" data-t="'+k+'">'+k+'</button>').join('');
-const o=document.getElementById('out');
-if(cur=='All stocks'){o.innerHTML='<input id=q placeholder="Search symbol, name or industry"><div id=tb></div>';
-const q=document.getElementById('q');q.oninput=all;all()}else o.innerHTML=TABS[cur]()}
-function all(){const q=document.getElementById('q').value.toLowerCase();
-let r=D.all.filter(x=>(x.symbol+x.name+x.industry).toLowerCase().includes(q));
-r.sort((a,b)=>sd*((a[sk]??-1e9)-(b[sk]??-1e9))||0);document.getElementById('tb').innerHTML=T(r.slice(0,150),A)}
-document.getElementById('mood').innerHTML='<b>Market mood: '+D.mood.label+'</b><div class=m>'+D.mood.text+'</div>';
-function detail(s){const x=D.all.find(a=>a.symbol==s),sp=x.spark||[],ds=D.sdates.slice(-sp.length),sc=D.sectors.find(a=>a.industry==x.industry);
-document.getElementById('md').innerHTML='<div><b>'+x.symbol+'</b> · '+x.name+'<div class=m>'+x.industry+'</div>'+chart(sp)+'<div id=tip class=m>Hover or touch the chart for date and price</div><p>Price '+F(x.price,2)+' · 1M '+F(x.ret1m,1)+'% · 3M '+F(x.ret3m,1)+'% · 6M '+F(x.ret6m,1)+'%<br>'+F(x.from_high,1)+'% from 52w high · volume '+F(x.vol_surge,2)+'× normal · '+F(x.dist200,1)+'% vs 200-day avg<br>Sector 3M median: '+(sc?F(sc.ret3m,1)+'%':'–')+' · Tag: '+(x.tag||'none')+'</p><button class="on" data-x=1>Close</button></div>';
-document.getElementById('md').style.display='block';hover(sp,ds)}
-const CW=300,CH=110,lo_=a=>Math.min(...a),hi_=a=>Math.max(...a);
-const cx=(i,n)=>i*CW/(n-1||1),cy=(v,a)=>8+(CH-26)*(1-(v-lo_(a))/((hi_(a)-lo_(a))||1));
-function chart(sp){const n=sp.length,hi=hi_(sp),lo=lo_(sp),up=sp[n-1]>=sp[0],col=up?'var(--up)':'var(--dn)',p=sp.map((v,i)=>cx(i,n).toFixed(1)+','+cy(v,sp).toFixed(1)).join(' ');
-const mk=(v,t)=>{const i=sp.indexOf(v),X=cx(i,n),Y=cy(v,sp);return '<circle cx='+X+' cy='+Y+' r=3 fill="'+col+'"/><text x='+X+' y='+(t=='H'?Y-5:Y+12)+' font-size=9 fill="var(--mut)" text-anchor='+(X>150?'end':'start')+'>'+t+' '+v.toFixed(1)+'</text>'};
-return '<svg id=ch viewBox="0 0 300 110" width=100% style="touch-action:none;cursor:crosshair"><polygon fill="'+col+'" opacity=.13 points="0,'+(CH-18)+' '+p+' '+CW+','+(CH-18)+'"/><polyline fill=none stroke="'+col+'" stroke-width=2 points="'+p+'"/>'+mk(hi,'H')+mk(lo,'L')+'<line id=cl y1=4 y2='+(CH-18)+' stroke="var(--mut)" stroke-dasharray="3 3" opacity=0 /><circle id=cd r=4.5 fill="'+col+'" stroke="var(--bg)" stroke-width=2 opacity=0 /></svg>'}
-function hover(sp,ds){const s=document.getElementById('ch');if(!s)return;const n=sp.length,hi=hi_(sp);
-const mv=e=>{const r=s.getBoundingClientRect(),i=Math.max(0,Math.min(n-1,Math.round((e.clientX-r.left)/r.width*(n-1)))),X=cx(i,n),Y=cy(sp[i],sp),l=document.getElementById('cl'),d=document.getElementById('cd'),ch=(sp[i]/sp[0]-1)*100;
-l.setAttribute('x1',X);l.setAttribute('x2',X);l.setAttribute('opacity',1);d.setAttribute('cx',X);d.setAttribute('cy',Y);d.setAttribute('opacity',1);
-document.getElementById('tip').innerHTML='<b>'+(ds[i]||'')+'</b> · ₹'+F(sp[i],2)+' · '+(ch>=0?'+':'')+F(ch,1)+'% vs a year ago · '+F((sp[i]/hi-1)*100,1)+'% from the high'};
-s.addEventListener('pointermove',mv);s.addEventListener('pointerdown',mv)}
-document.addEventListener('click',e=>{const t=e.target;
-if(t.classList.contains('st')){W.has(t.dataset.s)?W.delete(t.dataset.s):W.add(t.dataset.s);save();show();return}
-if(t.classList.contains('lk')){detail(t.dataset.s);return}
-if(t.dataset.x||t.id=='md'){document.getElementById('md').style.display='none';return}
-if(t.dataset.t){cur=t.dataset.t;show()}
-else if(t.tagName=='TH'&&cur=='All stocks'&&t.dataset.k){sd=sk==t.dataset.k?-sd:-1;sk=t.dataset.k;all()}});
-show();
-</script></body></html>"""
 
 if __name__ == "__main__":
     main()
